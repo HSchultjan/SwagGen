@@ -9,10 +9,185 @@ import Foundation
 import Alamofire
 import JSONUtilities
 
+public class APIClient {
+
+    public static var `default` = APIClient(baseURL: {{ options.name }}.baseURL)
+
+    public var behaviours: [RequestBehaviour] = []
+    public var baseURL: String
+    public var sessionManager: SessionManager
+    public var defaultHeaders: [String: String]
+    public var authorizer: RequestAuthorizer?
+
+    public init(baseURL: String, sessionManager: SessionManager = .default, defaultHeaders: [String: String] = [:], behaviours: [RequestBehaviour] = [], authorizer: RequestAuthorizer? = nil) {
+        self.baseURL = baseURL
+        self.authorizer = authorizer
+        self.sessionManager = sessionManager
+        self.behaviours = behaviours
+        self.defaultHeaders = defaultHeaders
+    }
+
+    /// any behaviours will be run in addition to the default ones
+    public func makeRequest<T>(request: APIRequest<T>, behaviours: [RequestBehaviour] = [], complete: @escaping (DataResponse<T>) -> Void) {
+        // create composite behaviour to make it easy to call functions on array of behaviours
+        let behaviours = APIRequestBehaviour(request: request, behaviours: self.behaviours + behaviours)
+
+        // create the url request from the request
+        var urlRequest: URLRequest
+        do {
+            urlRequest = try request.createURLRequest(baseURL: baseURL)
+        } catch let error {
+            let anyDataResponse = DataResponse<Any>(request: nil, response: nil, data: nil, result: .failure(error))
+            behaviours.onFailure(error: error)
+            behaviours.onComplete(response: anyDataResponse)
+            return
+        }
+
+        // add the default headers
+        if urlRequest.allHTTPHeaderFields == nil {
+            urlRequest.allHTTPHeaderFields = [:]
+        }
+        for (key, value) in defaultHeaders {
+            urlRequest.allHTTPHeaderFields?[key] = value
+        }
+
+        urlRequest = behaviours.modifyRequest(urlRequest)
+
+        // authorize request
+        if let authorizer = authorizer, let authorization = request.service.authorization {
+
+            authorizer.authorizeRequest(authorization: authorization, urlRequest: urlRequest) { result in
+                switch result {
+                case .success(let urlRequest):
+                    behaviours.beforeSend()
+                    self.makeNetworkRequest(urlRequest: urlRequest, decoder: request.service.decode, behaviour: behaviours, complete: complete)
+                case .failure(let error):
+                    let anyDataResponse = DataResponse<Any>(request: urlRequest, response: nil, data: nil, result: .failure(error))
+
+                    behaviours.onFailure(error: error)
+                    behaviours.onComplete(response: anyDataResponse)
+                }
+            }
+        } else {
+            behaviours.beforeSend()
+            self.makeNetworkRequest(urlRequest: urlRequest, decoder: request.service.decode, behaviour: behaviours, complete: complete)
+        }
+    }
+
+    private func makeNetworkRequest<T>(urlRequest: URLRequest, decoder: @escaping (Any) throws -> T, behaviour: APIRequestBehaviour<T>, complete: @escaping (DataResponse<T>) -> Void) {
+        sessionManager.request(urlRequest)
+            .validate()
+            .responseJSON { response in
+                let result: Result<T>
+
+                switch response.result {
+                case .success(let value):
+                    do {
+                        let decoded = try decoder(json: value)
+                        result = .success(decoded)
+                        behaviour.onSuccess(result: decoded)
+                    } catch let error {
+                        result = .failure(error)
+                        behaviour.onFailure(error: error)
+                    }
+                case .failure(let error):
+                    result = .failure(error)
+                    behaviour.onFailure(error: error)
+                }
+
+                let anyResult: Result<Any> = result.isSuccess ? .success(result.value!) : .failure(result.error!)
+                let anyResponse = DataResponse<Any>(request: response.request, response: response.response, data: response.data, result: anyResult, timeline: response.timeline)
+                behaviour.onComplete(response: anyResponse)
+
+                let dataResponse = DataResponse<T>(request: response.request, response: response.response, data: response.data, result: result, timeline: response.timeline)
+                complete(dataResponse)
+            }
+    }
+}
+
+public protocol RequestAuthorizer {
+
+    func authorizeRequest(authorization: Authorization, urlRequest: URLRequest, complete: (Result<URLRequest>) -> Void)
+}
+
+public protocol RequestBehaviour {
+
+    func modifyRequest(service: APIService<Any>, urlRequest: URLRequest) -> URLRequest
+    func beforeSend(service: APIService<Any>)
+    func onSuccess(service: APIService<Any>, result: Any)
+    func onFailure(service: APIService<Any>, error: Error)
+    func onComplete(service: APIService<Any>, response: DataResponse<Any>)
+}
+
+struct APIRequestBehaviour<T> {
+
+    let request: APIRequest<T>
+    let behaviours: [RequestBehaviour]
+    let service: APIService<Any>
+
+    init(request: APIRequest<T>, behaviours: [RequestBehaviour]) {
+        self.request = request
+        self.behaviours = behaviours
+
+        service = APIService<Any>(id: request.service.id, tag: request.service.tag, method: request.service.method, path: request.service.path, hasBody: request.service.hasBody, authorization: request.service.authorization, decode: request.service.decode)
+    }
+
+    func beforeSend() {
+        behaviours.forEach {
+            $0.beforeSend(service: service)
+        }
+    }
+
+    func onSuccess(result: Any) {
+        behaviours.forEach {
+            $0.onSuccess(service: service, result: result)
+        }
+    }
+
+    func onFailure(error: Error) {
+        behaviours.forEach {
+            $0.onFailure(service: service, error: error)
+        }
+    }
+
+    func onComplete(response: DataResponse<Any>) {
+        behaviours.forEach {
+            $0.onComplete(service: service, response: response)
+        }
+    }
+
+    func modifyRequest(_ urlRequest: URLRequest) -> URLRequest {
+        var urlRequest = urlRequest
+        behaviours.forEach {
+            urlRequest = $0.modifyRequest(service: service, urlRequest: urlRequest)
+        }
+        return urlRequest
+    }
+}
+
+extension RequestBehaviour {
+
+    func beforeSend(service: APIService<Any>) {
+    }
+
+    func onSuccess(service: APIService<Any>, result: Any) {
+    }
+
+    func onFailure(service: APIService<Any>, error: Error) {
+    }
+
+    func onComplete(service: APIService<Any>, response: DataResponse<Any>) {
+    }
+
+    func modifyRequest(service: APIService<Any>, urlRequest: URLRequest) -> URLRequest {
+        return urlRequest
+    }
+}
+
 extension APIRequest {
 
     /// pass in an optional baseURL, otherwise {{ options.name }}.baseURL will be used
-    public func createURLRequest(baseURL: String? = nil) -> URLRequest {
+    public func createURLRequest(baseURL: String? = nil) throws -> URLRequest {
         let url = URL(string: "\(baseURL ?? {{ options.name }}.baseURL)\(path)")!
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = service.method
@@ -26,42 +201,14 @@ extension APIRequest {
             }
         }
         if !params.isEmpty {
-            let encoding:ParameterEncoding = service.hasBody ? URLEncoding.httpBody : URLEncoding.queryString
-            urlRequest = try! encoding.encode(urlRequest, with: params)
+            let encoding: ParameterEncoding = service.hasBody ? URLEncoding.httpBody : URLEncoding.queryString
+            urlRequest = try encoding.encode(urlRequest, with: params)
         }
         if let jsonBody = jsonBody {
             // not using Alamofire's JSONEncoding so that we can send a json array instead of being restricted to [String: Any]
-            urlRequest.httpBody = try! JSONSerialization.data(withJSONObject: jsonBody)
+            urlRequest.httpBody = try JSONSerialization.data(withJSONObject: jsonBody)
             urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
         return urlRequest
-    }
-
-    /// pass in an optional baseURL, otherwise {{ options.name }}.baseURL will be used
-    @discardableResult
-    public func makeNetworkRequest(baseURL: String? = nil, sessionManager: SessionManager = .default, completion:@escaping (DataResponse<ResponseType>) -> Void) -> Request? {
-        let urlRequest = createURLRequest(baseURL: baseURL)
-        return sessionManager.request(urlRequest)
-        .validate()
-        .responseJSON { response in
-            let result: Result<ResponseType>
-            switch response.result {
-            case .success(let value):
-                if () is ResponseType {
-                    result = .success(() as! ResponseType)
-                } else {
-                    do {
-                        let decoded = try self.service.decode(json: value)
-                        result = .success(decoded)
-                    }
-                    catch let error {
-                        result = .failure(error)
-                    }
-                }
-            case .failure(let error):
-                result = .failure(error)
-            }
-            completion(DataResponse(request: response.request, response: response.response, data: response.data, result: result, timeline: response.timeline))
-        }
     }
 }
